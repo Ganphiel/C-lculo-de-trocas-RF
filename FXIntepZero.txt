@@ -1,0 +1,25 @@
+let
+    FxInterpZero = (CurveTable as table, BaseDate as date, TargetDate as date) as nullable number =>
+    let
+        Snap = Table.SelectRows(CurveTable, each [Data_Base] = BaseDate),
+        Clean = Table.SelectRows(Snap, each [Taxa_AA] <> null and [t] <> null),
+        Sorted = Table.Sort(Clean, {{"t", Order.Ascending}}),
+
+        tT = Duration.Days(TargetDate - BaseDate) / 365.0,
+
+        Lower = Table.SelectRows(Sorted, each [t] <= tT),
+        Upper = Table.SelectRows(Sorted, each [t] >= tT),
+
+        L = if Table.RowCount(Lower)=0 then null else Lower{Table.RowCount(Lower)-1},
+        U = if Table.RowCount(Upper)=0 then null else Upper{0},
+
+        r =
+            if L=null and U=null then null
+            else if L=null then U[Taxa_AA]
+            else if U=null then L[Taxa_AA]
+            else if L[t]=U[t] then L[Taxa_AA]
+            else L[Taxa_AA] + (tT-L[t])*(U[Taxa_AA]-L[Taxa_AA])/(U[t]-L[t])
+    in
+        r
+in
+    FxInterpZero

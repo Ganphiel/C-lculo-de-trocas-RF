@@ -1,0 +1,29 @@
+let
+    Fonte = Consulta1
+in
+    let
+    Fonte = Consulta1,  // <-- troque pelo nome exato da sua query de staging
+
+    AddDataBase = Table.AddColumn(Fonte, "Data_Base", each Date.From(DateTime.LocalNow()), type date),
+
+    AddAgioDesagio = Table.AddColumn(
+        AddDataBase,
+        "Agio_Desagio",
+        each
+            let
+                r = [Retorno_Pct],
+                rs = [Retorno_Saida_Pct]
+            in
+                if r = null or rs = null then null
+                else ((1 + (rs/100)) / (1 + (r/100))) - 1,
+        type number
+    ),
+
+    AddDuration = Table.AddColumn(
+        AddAgioDesagio,
+        "Duration_Anos",
+        each if [Vencimento] = null then null else Duration.Days([Vencimento] - [Data_Base]) / 365,
+        type number
+    )
+in
+    AddDuration

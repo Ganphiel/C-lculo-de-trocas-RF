@@ -1,0 +1,279 @@
+let
+    // =========================
+    // 0) Inputs
+    // =========================
+    Papeis0 = Consulta1,
+    Papeis = Table.TransformColumnTypes(
+        Papeis0,
+        {{"Vencimento", type date}, {"Bruto_Curva", type number}, {"Bruto_Venda", type number},
+         {"Indexador_Compra", type text}, {"Taxa_Compra", type number}}
+    ),
+
+    Trocas0 = Excel.CurrentWorkbook(){[Name="tb_papel_troca"]}[Content],
+    Trocas = Table.TransformColumnTypes(
+        Trocas0,
+        {
+            {"Nome", type text},
+            {"Codigo_Cetip", type text},
+            {"Indexador", type text},
+            {"Spread", type number},
+            {"Percentual_CDI", type number},
+            {"Vencimento", type date},
+            {"PU", type number},
+            {"Duration", type number}
+        }
+    ),
+
+    CurvaDI = Curva_DI_Base,
+    CurvaIMP = Curva_IMP_Base,
+
+    BaseDate = List.Max(CurvaDI[Data_Base]),
+
+    // =========================
+    // 1) Horizonte máximo global (bound superior p/ tabela de meses)
+    // =========================
+    MaxBase = List.Max(Papeis[Vencimento]),
+    MaxTroca = if Table.RowCount(Trocas)=0 then MaxBase else List.Max(Trocas[Vencimento]),
+    HmaxGlobal = if MaxBase <= MaxTroca then MaxBase else MaxTroca,
+
+    // =========================
+    // 2) Tabela de meses (uma vez)
+    // =========================
+    StartMonth = Date.StartOfMonth(BaseDate),
+    EndMonth = Date.StartOfMonth(HmaxGlobal),
+
+    MesesList =
+        List.Generate(
+            () => StartMonth,
+            (d) => d <= EndMonth,
+            (d) => Date.AddMonths(d, 1),
+            (d) => d
+        ),
+
+    Meses = Table.AddIndexColumn(
+        Table.FromList(MesesList, Splitter.SplitByNothing(), {"Mes"}, null, ExtraValues.Error),
+        "MesIdx",
+        0,
+        1,
+        Int64.Type
+    ),
+
+    // =========================
+    // 3) Interpolar curvas somente nesses meses
+    // =========================
+    AddZeroDI  = Table.AddColumn(Meses, "Zero_DI_AA", each FxInterpZero1(CurvaDI, BaseDate, [Mes]), type number),
+    // CORREÇÃO: o passo anterior é AddZeroDI (não AddZeroDAP)
+    AddImp     = Table.AddColumn(AddZeroDI, "Inflacao_Imp_AA", each FxInterpZero1(CurvaIMP, BaseDate, [Mes]), type number),
+
+    // Listas (para cálculo rápido por linha sem expandir meses)
+    ZeroDIList  = AddImp[Zero_DI_AA],
+    InflList    = AddImp[Inflacao_Imp_AA],
+    MesList     = AddImp[Mes],
+
+    // =========================
+    // 4) Função: fator acumulado do PAPEL BASE usando Indexador_Compra/Taxa_Compra
+    //    (produto mensal até MesIdx)
+    // =========================
+    FxBaseCum =
+        (idx as nullable text, taxa as nullable number, hIdx as nullable number) as nullable number =>
+        let
+            IDX0 = if idx=null then "" else Text.Replace(Text.Upper(Text.Trim(idx)), " ", ""),
+            n = if hIdx=null then 0 else Number.From(hIdx) + 1,
+
+            // segurança
+            out =
+                if n <= 0 then null
+                else if taxa = null then null
+                else
+                    let
+                        pos = List.Numbers(0, n),
+
+                        fatores =
+                            List.Transform(
+                                pos,
+                                (i) =>
+                                    let
+                                        rDI  = ZeroDIList{i},
+                                        pi  = InflList{i}
+                                    in
+                                        if IDX0 = "%CDI" then
+                                            if rDI=null then null else Number.Power(1 + (rDI * taxa), 1/12)
+                                        else if IDX0 = "CDI+" or IDX0 = "CDI" then
+                                            if rDI=null then null else Number.Power(1 + (rDI + taxa), 1/12)
+                                        else if IDX0 = "PRE" then
+                                            Number.Power(1 + taxa, 1/12)
+                                        else if IDX0 = "IPCA+" then
+                                             if pi=null then null
+                                            else Number.Power(1 + pi, 1/12) * Number.Power(1 + taxa, 1/12)
+                                        else
+                                            null
+                            ),
+
+                        prod = List.Product(List.RemoveNulls(fatores))
+                    in
+                        if prod = null then null else prod
+        in
+            out,
+
+    // =========================
+    // 5) Função: cumprod da TROCA por mês (por cada papel troca)
+    // =========================
+    FxTrocaCum =
+        (idx as text, spread as nullable number, perc as nullable number) as table =>
+        let
+            IDX = Text.Replace(Text.Upper(Text.Trim(idx)), " ", ""),
+
+            fatores =
+                List.Transform(
+                    List.Numbers(0, List.Count(MesList)),
+                    (i) =>
+                        let
+                            rDI  = ZeroDIList{i},
+                            pi   = InflList{i},
+                            sp   = spread,
+                            pc   = perc
+                        in
+                            if IDX = "%CDI" then
+                                if rDI=null or pc=null then null else Number.Power(1 + (rDI * pc), 1/12)
+                            else if IDX = "CDI+" or IDX="CDI" then
+                                if rDI=null or sp=null then null else Number.Power(1 + (rDI + sp), 1/12)
+                            else if IDX = "PRE" then
+                                if sp=null then null else Number.Power(1 + sp, 1/12)
+                            else if IDX = "IPCA+" then
+                                if pi=null or sp=null then null
+                                else Number.Power(1 + pi, 1/12) * Number.Power(1 + sp, 1/12)
+                            else
+                                null
+                ),
+
+            clean = List.RemoveNulls(fatores),
+
+            cum =
+                List.Accumulate(
+                    clean,
+                    {},
+                    (state, current) =>
+                        state & { if List.Count(state)=0 then current else List.Last(state) * current }
+                ),
+
+            Out =
+                Table.FromColumns(
+                    {MesList, List.Numbers(0, List.Count(MesList)), cum},
+                    {"Mes", "MesIdx", "Fator_Troca_Acumulado"}
+                )
+        in
+            Out,
+
+    // =========================
+    // 6) Construir tabela (trocas × meses) de fatores acumulados
+    // =========================
+    TrocasWithID = Table.AddIndexColumn(Trocas, "TrocaID", 1, 1, Int64.Type),
+
+    TrocaCurvas =
+        Table.AddColumn(
+            TrocasWithID,
+            "CurvaTroca",
+            each FxTrocaCum([Indexador], [Spread], [Percentual_CDI]),
+            type table
+        ),
+
+    TrocaCurvasExpanded =
+        Table.ExpandTableColumn(
+            TrocaCurvas,
+            "CurvaTroca",
+            {"Mes", "MesIdx", "Fator_Troca_Acumulado"},
+            {"Mes", "MesIdx", "Fator_Troca_Acumulado"}
+        ),
+
+    // =========================
+    // 7) Cross join papel × troca (SEM expandir meses)
+    // =========================
+    AddTrocas = Table.AddColumn(Papeis, "Trocas", each TrocasWithID),
+    Cross = Table.ExpandTableColumn(
+        AddTrocas,
+        "Trocas",
+        {"TrocaID","Nome","Codigo_Cetip","Indexador","Spread","Percentual_CDI","Vencimento","PU","Duration"},
+        {"TrocaID","Troca_Nome","Troca_Codigo_Cetip","Troca_Indexador","Troca_Spread","Troca_Perc_CDI","Troca_Vencimento","Troca_PU","Troca_Duration"}
+    ),
+
+    AddH = Table.AddColumn(
+        Cross,
+        "H",
+        each if [Troca_Vencimento]=null then [Vencimento]
+             else if [Vencimento] <= [Troca_Vencimento] then [Vencimento] else [Troca_Vencimento],
+        type date
+    ),
+
+    AddHMes = Table.AddColumn(AddH, "H_Mes", each Date.StartOfMonth([H]), type date),
+
+    HIdxTable = Table.FromColumns({MesList, List.Numbers(0, List.Count(MesList))}, {"Mes","MesIdx"}),
+    JoinHIdx = Table.NestedJoin(AddHMes, {"H_Mes"}, HIdxTable, {"Mes"}, "HX", JoinKind.LeftOuter),
+    ExpandHIdx = Table.ExpandTableColumn(JoinHIdx, "HX", {"MesIdx"}, {"H_MesIdx"}),
+
+    JoinH_Troca = Table.NestedJoin(ExpandHIdx, {"TrocaID","H_MesIdx"}, TrocaCurvasExpanded, {"TrocaID","MesIdx"}, "TRH", JoinKind.LeftOuter),
+    ExpandTRH = Table.ExpandTableColumn(JoinH_Troca, "TRH", {"Fator_Troca_Acumulado"}, {"Fator_Troca_Acumulado"}),
+
+    // =========================
+    // 8) Fator acumulado do papel BASE (usando taxa do papel base!)
+    // =========================
+    AddFatorBase = Table.AddColumn(
+        ExpandTRH,
+        "Fator_Base_Acumulado",
+        each FxBaseCum([Indexador_Compra], [Taxa_Compra], [H_MesIdx]),
+        type number
+    ),
+
+    // =========================
+    // 9) Valores econômicos + retornos ajustados
+    // =========================
+    AddK = Table.AddColumn(
+        AddFatorBase,
+        "K_Desagio_Agio",
+        each if [Bruto_Curva]=null or [Bruto_Venda]=null or [Bruto_Curva]=0 then null else [Bruto_Venda]/[Bruto_Curva],
+        type number
+    ),
+
+    AddVFBase = Table.AddColumn(
+        AddK,
+        "VF_Base",
+        each if [Bruto_Curva]=null or [Fator_Base_Acumulado]=null then null else [Bruto_Curva]*[Fator_Base_Acumulado],
+        type number
+    ),
+
+    AddVFTroca = Table.AddColumn(
+        AddVFBase,
+        "VF_Troca",
+        each if [Bruto_Venda]=null or [Fator_Troca_Acumulado]=null then null else [Bruto_Venda]*[Fator_Troca_Acumulado],
+        type number
+    ),
+
+    AddRetBase = Table.AddColumn(
+        AddVFTroca,
+        "Ret_Base_Carregado",
+        each if [Fator_Base_Acumulado]=null then null else [Fator_Base_Acumulado]-1,
+        type number
+    ),
+
+    AddRetTrocaAdj = Table.AddColumn(
+        AddRetBase,
+        "Ret_Troca_Carregado_Ajustado",
+        // CORREÇÃO: nome da coluna é [VF_Troca], não [VFTroca]
+        each if [VF_Troca]=null or [Bruto_Curva]=null or [Bruto_Curva]=0 then null else ([VF_Troca]/[Bruto_Curva]) - 1,
+        type number
+    ) meta [IsParameterQuery=false],
+
+    AddExcessoBRL = Table.AddColumn(
+        AddRetTrocaAdj,
+        "Excesso_R$",
+        each if [VF_Troca]=null or [VF_Base]=null then null else [VF_Troca]-[VF_Base],
+        type number
+    ),
+
+    AddExcessoPct = Table.AddColumn(
+        AddExcessoBRL,
+        "Excesso_%",
+        each if [VF_Base]=null or [VF_Base]=0 or [VF_Troca]=null then null else ([VF_Troca]/[VF_Base])-1,
+        type number
+    )
+in
+    AddExcessoPct

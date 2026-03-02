@@ -1,0 +1,366 @@
+let
+    // =========================
+    // Fonte: tabela com 1 coluna no Excel (xp_raw)
+    // =========================
+    Source = Excel.CurrentWorkbook(){[Name="xp_raw"]}[Content],
+    ColNames = Table.ColumnNames(Source),
+    RawCol = ColNames{0},
+    Keep1Col = Table.SelectColumns(Source, {RawCol}),
+    Renamed = Table.RenameColumns(Keep1Col, {{RawCol, "Texto"}}),
+
+    ToText = Table.TransformColumns(
+        Renamed,
+        {{"Texto", each if _ = null then "" else Text.Trim(Text.From(_)), type text}}
+    ),
+    NonEmpty = Table.SelectRows(ToText, each [Texto] <> ""),
+    AddIndex = Table.AddIndexColumn(NonEmpty, "i", 0, 1, Int64.Type),
+
+    // Buffer para performance
+    BufTable = Table.Buffer(AddIndex),
+    TxtList = List.Buffer(BufTable[Texto]),
+    IdxList = List.Buffer(BufTable[i]),
+
+    // =========================
+    // Funções utilitárias
+    // =========================
+    // Converte número robusto:
+    // - pt-BR: 1.234.567,89
+    // - decimal com ponto: 430481.97 / 0.1181
+    // - decimal com vírgula: 10,50
+    FxToNumber = (x as any) as nullable number =>
+        let
+            t = try x otherwise null,
+            out =
+                if t is number then t
+                else
+                    let
+                        s0 = Text.Trim(Text.From(t)),
+                        s1 = Text.Replace(s0, "R$", ""),
+                        s2 = Text.Replace(s1, " ", ""),
+
+                        hasComma = Text.Contains(s2, ","),
+                        dotCount = Text.Length(s2) - Text.Length(Text.Replace(s2, ".", "")),
+
+                        norm =
+                            if hasComma and Text.Contains(s2, ".") then
+                                Text.Replace(Text.Replace(s2, ".", ""), ",", ".")
+                            else if hasComma and not Text.Contains(s2, ".") then
+                                Text.Replace(s2, ",", ".")
+                            else if (not hasComma) and Text.Contains(s2, ".") then
+                                if dotCount > 1 then Text.Replace(s2, ".", "") else s2
+                            else
+                                s2,
+
+                        n = try Number.FromText(norm, "en-US") otherwise null
+                    in
+                        n
+        in
+            out,
+
+    FxToDate = (x as any) as nullable date =>
+        let
+            s = Text.Trim(Text.From(x)),
+            d1 = try Date.FromText(Text.Start(s, 10), "pt-BR") otherwise null,
+            d2 = if d1 <> null then d1 else (try Date.From(DateTime.FromText(s)) otherwise null)
+        in
+            d2,
+
+    // Extrai vencimento e aplicação de "dd/mm/yyyyR$ 49.925,94"
+    FxParseVencAp = (s as text) as record =>
+        let
+            vencTxt = Text.Start(s, 10),
+            venc = try Date.FromText(vencTxt, "pt-BR") otherwise null,
+            pos = Text.PositionOf(s, "R$"),
+            apTxt = if pos >= 0 then Text.Range(s, pos + 2) else "",
+            ap = FxToNumber(apTxt)
+        in
+            [Vencimento = venc, Aplicacao = ap],
+
+    FxFindIndexContains = (lst as list, pattern as text) as number =>
+        let
+            p = Text.Lower(pattern),
+            lower = List.Transform(lst, each Text.Lower(Text.From(_))),
+            pos = List.PositionOf(List.Transform(lower, each Text.Contains(_, p)), true)
+        in
+            pos,
+
+    FxNextNonEmpty = (lst as list, startAt as number) as nullable text =>
+        let
+            tail = if startAt < 0 then {} else List.Skip(lst, startAt),
+            non = List.Select(tail, each _ <> null and Text.Trim(Text.From(_)) <> ""),
+            out = if List.Count(non) > 0 then Text.From(non{0}) else null
+        in
+            out,
+
+    // Identifica se uma linha PARECE taxa (para não confundir com valores / retorno)
+    FxIsRateLine = (t as text) as logical =>
+        let
+            s = Text.Trim(t),
+            u = Text.Upper(s),
+            // rejeições óbvias
+            bad =
+                s = "" or
+                Text.Contains(u, "R$") or
+                Text.Contains(u, "SIMULAR") or
+                Text.Contains(u, "RESGATAR") or
+                Text.Contains(u, "TROCA"),
+            isDateLike = (Text.Length(s) >= 10 and Text.Middle(s,2,1)="/" and Text.Middle(s,5,1)="/"),
+            // sinais positivos
+            hasIdx = Text.Contains(u, "CDI") or Text.Contains(u, "IPCA") or Text.Contains(u, "IPC-A") or Text.Contains(u, "PRÉ") or Text.Contains(u, "PRE"),
+            hasPct = Text.Contains(u, "%"),
+            n = FxToNumber(s),
+            // taxa pré "crua" vem como 0.1181 etc (pequena). Evita capturar retorno tipo 0.8168.
+            isSmallRate = (n <> null and n >= 0.02 and n <= 0.50)
+        in
+            (not bad) and (not isDateLike) and (hasIdx or hasPct or isSmallRate),
+
+    // Parseia taxa:
+    // - "IPCA + 7,39%" => IPCA+, 0.0739
+    // - "CDI 110,00%"  => %CDI, 1.10
+    // - "CDI + 1,30%"  => CDI+, 0.013
+    // - "10,00%"       => PRE, 0.10
+    // - "0.1181"       => PRE, 0.1181
+    FxParseRate = (rateText as nullable text) as record =>
+        let
+            t0 = if rateText = null then "" else Text.Trim(rateText),
+            tU = Text.Upper(t0),
+            t1 = Text.Replace(tU, "IPC-A", "IPCA"),
+            t2 = Text.Replace(t1, "PRÉ", "PRE"),
+
+            hasCDI = Text.Contains(t2, "CDI"),
+            hasIPCA = Text.Contains(t2, "IPCA"),
+            hasPlus = Text.Contains(t2, "+"),
+            hasPct = Text.Contains(t2, "%"),
+            hasPRE = Text.Contains(t2, "PRE"),
+
+            numTxt = Text.Select(t2, {"0".."9", ",", ".", "-"}),
+            numVal = FxToNumber(numTxt),
+
+            idxType =
+                if hasCDI and hasPct and not hasPlus then "%CDI"
+                else if hasCDI and hasPlus then "CDI+"
+                else if hasIPCA and hasPlus then "IPCA+"
+                else if hasPRE then "PRE"
+                // fallback PRE APENAS se for número plausível de taxa (evita transformar BrutoCurva em PRE)
+                else if numVal <> null and ((hasPct) or (numVal >= 0.02 and numVal <= 0.50)) then "PRE"
+                else null,
+
+            taxaNum =
+                if numVal = null then null
+                else if idxType = "%CDI" then numVal / 100
+                else if hasPct then numVal / 100
+                else if numVal <= 1 then numVal
+                else null
+        in
+            [IndexadorTipo = idxType, TaxaNum = taxaNum],
+
+    // =========================
+    // DETECTOR ROBUSTO DE CÓDIGO (CETIP)
+    // =========================
+    IsCodigo = (t as text) as logical =>
+        let
+            s = Text.Trim(t),
+            u = Text.Upper(s),
+
+            noSpace = not Text.Contains(s, " "),
+            lenOk = Text.Length(s) >= 4 and Text.Length(s) <= 25,
+
+            notMoney = not Text.StartsWith(u, "R$"),
+            notPct = not Text.Contains(s, "%"),
+            notDate = not (Text.Length(s) >= 10 and Text.Middle(s,2,1)="/" and Text.Middle(s,5,1)="/"),
+
+            hasLetter = Text.Length(Text.Select(u, {"A".."Z"})) > 0,
+            noDecimalSeparators = not Text.Contains(s, ".") and not Text.Contains(s, ","),
+
+            notHeader =
+                not Text.Contains(Text.Lower(s), "vencimento") and
+                not Text.Contains(Text.Lower(s), "aplicação") and
+                not Text.Contains(Text.Lower(s), "taxa") and
+                not Text.Contains(Text.Lower(s), "rendimento") and
+                not Text.Contains(Text.Lower(s), "retorno") and
+                not Text.Contains(Text.Lower(s), "outras informações") and
+                not Text.Contains(Text.Lower(s), "simular") and
+                not Text.Contains(Text.Lower(s), "resgatar") and
+                not Text.Contains(Text.Lower(s), "ativos")
+        in
+            noSpace and lenOk and notMoney and notPct and notDate and hasLetter and noDecimalSeparators and notHeader,
+
+    // Início do bloco: linha atual é o CÓDIGO
+    StartIdx =
+        List.Buffer(
+            List.Select(
+                IdxList,
+                (ix) => ix > 0 and IsCodigo(TxtList{ix}) and (Text.Trim(TxtList{ix-1}) <> "")
+            )
+        ),
+
+    SafeStartIdx =
+        if List.Count(StartIdx) = 0
+        then error "Não encontrei códigos para delimitar blocos. Verifique se a colagem inclui o código do ativo em uma linha própria."
+        else StartIdx,
+
+    MaxI = List.Max(IdxList),
+    StartIdxWithEnd = List.Buffer(List.Combine({SafeStartIdx, {MaxI + 1}})),
+
+    // =========================
+    // Parse do bloco
+    // =========================
+    FxParseBlock = (block as list, startGlobalIndex as number) as record =>
+        let
+            b = List.Transform(block, each Text.Trim(Text.From(_))),
+
+            Nome = if startGlobalIndex > 0 then Text.Trim(TxtList{startGlobalIndex - 1}) else null,
+            Codigo = if List.Count(b) > 0 then b{0} else null,
+
+            // Linha vencimento+aplicação
+            VencApLine =
+                let
+                    ok = List.Select(b, each Text.Length(_) >= 12 and Text.Middle(_, 2, 1) = "/" and Text.Middle(_, 5, 1) = "/" and Text.Contains(_, "R$")),
+                    out = if List.Count(ok) > 0 then ok{0} else null
+                in
+                    out,
+
+            VencAp = if VencApLine <> null then FxParseVencAp(VencApLine) else [Vencimento=null, Aplicacao=null],
+            posVencAp = if VencApLine <> null then List.PositionOf(b, VencApLine) else -1,
+
+            // Pega uma janela curta de linhas após VencAp e filtra as que parecem taxa
+            WindowAfterVenc =
+                if posVencAp >= 0 then
+                    List.Range(b, posVencAp + 1, 12)   // janela curta (ajuste para 15 se precisar)
+                else
+                    {},
+
+            RateCandidates = List.Select(WindowAfterVenc, each FxIsRateLine(_)),
+TaxaCompraText = if List.Count(RateCandidates) >= 1 then RateCandidates{0} else null,
+
+// ✅ TaxaVenda só é válida se também "parecer taxa" por um critério mais estrito
+TaxaVendaCandidate = if List.Count(RateCandidates) >= 2 then RateCandidates{1} else null,
+TaxaVendaText =
+    if TaxaVendaCandidate = null then null
+    else
+        let
+            u = Text.Upper(Text.Trim(TaxaVendaCandidate)),
+            n = FxToNumber(TaxaVendaCandidate),
+            // Estrito: ou tem CDI/IPCA/% ou é uma taxa pequena decimal (0.02 a 0.50)
+            isStrictRate =
+                (Text.Contains(u, "CDI") or Text.Contains(u, "IPCA") or Text.Contains(u, "IPC-A") or Text.Contains(u, "%"))
+                or (n <> null and n >= 0.02 and n <= 0.50)
+        in
+            if isStrictRate then TaxaVendaCandidate else null,
+
+            CompraParsed = FxParseRate(TaxaCompraText),
+            VendaParsed  = FxParseRate(TaxaVendaText),
+
+            // Números (bruto/rendimento/retorno)
+           // Remove das linhas numéricas: Vencimento+Aplicação e as taxas (para não deslocar Bruto/Rendimento/Retorno)
+NumSource =
+    List.RemoveItems(
+        b,
+        List.RemoveNulls({ VencApLine, TaxaCompraText, TaxaVendaText })
+    ),
+
+                OnlyNums = List.Buffer(List.RemoveNulls(List.Transform(NumSource, each FxToNumber(_)))),
+
+                BrutoCurva = if List.Count(OnlyNums) >= 1 then OnlyNums{0} else null,
+                BrutoVenda = if List.Count(OnlyNums) >= 2 then OnlyNums{1} else null,
+                Rendimento = if List.Count(OnlyNums) >= 3 then OnlyNums{2} else null,
+                RendimentoSaida = if List.Count(OnlyNums) >= 4 then OnlyNums{3} else null,
+                RetornoDec = if List.Count(OnlyNums) >= 5 then OnlyNums{4} else null,
+                RetornoSaidaDec = if List.Count(OnlyNums) >= 6 then OnlyNums{5} else null,
+
+            // Outras informações (só aparece se expandir antes de copiar)
+            posDataAplic = FxFindIndexContains(b, "data da aplicação"),
+            DataAplicTxt = if posDataAplic >= 0 then FxNextNonEmpty(b, posDataAplic + 1) else null,
+            DataAplicacao = if DataAplicTxt <> null then FxToDate(DataAplicTxt) else null,
+
+            posJuros = FxFindIndexContains(b, "juros + amortização"),
+            JurosTxt = if posJuros >= 0 then FxNextNonEmpty(b, posJuros + 1) else null,
+            JurosAmortizacao = if JurosTxt <> null then FxToNumber(JurosTxt) else null,
+
+            RowID_Base =
+                if DataAplicacao <> null then
+                    Codigo & "|" & Date.ToText(DataAplicacao, "yyyy-MM-dd") & "|" & Text.From(VencAp[Aplicacao])
+                else
+                    Codigo & "|" & Date.ToText(VencAp[Vencimento], "yyyy-MM-dd") & "|" & Text.From(VencAp[Aplicacao]) & "|" & Text.From(TaxaCompraText)
+        in
+            [
+                Nome = Nome,
+                Codigo = Codigo,
+                Vencimento = VencAp[Vencimento],
+                Aplicacao = VencAp[Aplicacao],
+
+                Taxa_Compra_Texto = TaxaCompraText,
+                Indexador_Compra = CompraParsed[IndexadorTipo],
+                Taxa_Compra = CompraParsed[TaxaNum],
+
+                Taxa_Venda_Texto = TaxaVendaText,
+                Indexador_Venda = VendaParsed[IndexadorTipo],
+                Taxa_Venda = VendaParsed[TaxaNum],
+
+                Bruto_Curva = BrutoCurva,
+                Bruto_Venda = BrutoVenda,
+                Rendimento = Rendimento,
+                Rendimento_Saida = RendimentoSaida,
+                Retorno_Pct = RetornoPct,
+                Retorno_Saida_Pct = RetornoSaidaPct,
+
+                Data_Aplicacao = DataAplicacao,
+                Juros_Amortizacao = JurosAmortizacao,
+
+                RowID_Base = RowID_Base
+            ],
+
+    // =========================
+    // Cria blocos por slicing
+    // =========================
+    Blocks =
+        List.Transform(
+            {0..(List.Count(StartIdxWithEnd)-2)},
+            (k) =>
+                let
+                    s = StartIdxWithEnd{k},
+                    e = StartIdxWithEnd{k+1},
+                    lst = List.Range(TxtList, s, e - s)
+                in
+                    FxParseBlock(lst, s)
+        ),
+
+    Output = Table.FromRecords(Blocks),
+
+    // Sequencial e RowID final (sempre único)
+    WithSeq = Table.AddIndexColumn(Output, "RowID_Seq", 1, 1, Int64.Type),
+    WithRowID = Table.AddColumn(WithSeq, "RowID", each [RowID_Base] & "|" & Text.PadStart(Text.From([RowID_Seq]), 4, "0"), type text),
+
+    Typed = Table.TransformColumnTypes(
+        WithRowID,
+        {
+            {"RowID", type text},
+            {"RowID_Base", type text},
+            {"RowID_Seq", Int64.Type},
+
+            {"Nome", type text},
+            {"Codigo", type text},
+            {"Vencimento", type date},
+            {"Aplicacao", type number},
+
+            {"Taxa_Compra_Texto", type text},
+            {"Indexador_Compra", type text},
+            {"Taxa_Compra", type number},
+
+            {"Taxa_Venda_Texto", type text},
+            {"Indexador_Venda", type text},
+            {"Taxa_Venda", type number},
+
+            {"Bruto_Curva", type number},
+            {"Bruto_Venda", type number},
+            {"Rendimento", type number},
+            {"Rendimento_Saida", type number},
+            {"Retorno_Pct", type number},
+            {"Retorno_Saida_Pct", type number},
+
+            {"Data_Aplicacao", type date},
+            {"Juros_Amortizacao", type number}
+        }
+    )
+in
+    Typed
