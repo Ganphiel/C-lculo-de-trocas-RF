@@ -277,6 +277,30 @@ let
         "Excesso_%",
         each if [VF_Base]=null or [VF_Base]=0 or [VF_Troca]=null then null else ([VF_Troca]/[VF_Base])-1,
         type number
+    ),
+
+    AddBreakeven = Table.AddColumn(
+        AddExcessoPct,
+        "Breakeven_Meses",
+        each
+            let
+                bc = [Bruto_Curva],
+                bv = [Bruto_Venda],
+                fb = [Fator_Base_Acumulado],
+                ft = [Fator_Troca_Acumulado],
+                T  = Duration.Days([H] - BaseDate) / 360.0,
+
+                rb = if fb=null or T=null or T<=0 then null else Number.Power(fb, 1/T) - 1,
+                rt = if ft=null or T=null or T<=0 then null else Number.Power(ft, 1/T) - 1,
+
+                denom = if rb=null or rt=null then null else Number.Log(1+rt) - Number.Log(1+rb),
+
+                tYears =
+                    if bc=null or bv=null or bc<=0 or bv<=0 or denom=null or denom<=0 then null
+                    else Number.Log(bc/bv) / denom
+            in
+                if tYears=null then null else 12*tYears,
+        type number
     )
 in
-    AddExcessoPct
+    AddBreakeven
