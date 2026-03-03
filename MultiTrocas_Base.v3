@@ -277,6 +277,84 @@ let
         "Excesso_%",
         each if [VF_Base]=null or [VF_Base]=0 or [VF_Troca]=null then null else ([VF_Troca]/[VF_Base])-1,
         type number
+    ),
+
+    AddBreakeven = Table.AddColumn(
+        AddExcessoPct,
+        "Breakeven_Meses",
+        each
+            let
+                bc = [Bruto_Curva],
+                bv = [Bruto_Venda],
+                fb = [Fator_Base_Acumulado],
+                ft = [Fator_Troca_Acumulado],
+                T  = Duration.Days([H] - BaseDate) / 360.0,
+
+                rb = if fb=null or T=null or T<=0 then null else Number.Power(fb, 1/T) - 1,
+                rt = if ft=null or T=null or T<=0 then null else Number.Power(ft, 1/T) - 1,
+
+                denom = if rb=null or rt=null then null else Number.Log(1+rt) - Number.Log(1+rb),
+
+                tYears =
+                    if bc=null or bv=null or bc<=0 or bv<=0 or denom=null or denom<=0 then null
+                    else Number.Log(bc/bv) / denom
+            in
+                if tYears=null then null else 12*tYears,
+        type number
+    ),
+
+    AddDesagioPct = Table.AddColumn(
+        AddBreakeven,
+        "Desagio_%",
+        each if [Bruto_Curva]=null or [Bruto_Curva]=0 or [Bruto_Venda]=null
+             then null
+             else ([Bruto_Venda]/[Bruto_Curva]) - 1,
+        type number
+    ),
+
+    AddTAnos = Table.AddColumn(
+        AddDesagioPct,
+        "T_Anos_360",
+        each if [H]=null then null else Duration.Days([H] - BaseDate) / 360.0,
+        type number
+    ),
+
+    AddExcessoAnualizado = Table.AddColumn(
+        AddTAnos,
+        "Excesso_Anualizado",
+        each
+            let
+                vfB = [VF_Base],
+                vfT = [VF_Troca],
+                T   = [T_Anos_360]
+            in
+                if vfB=null or vfT=null or vfB<=0 or T=null or T<=0
+                then null
+                else Number.Power(vfT/vfB, 1/T) - 1,
+        type number
+    ),
+
+    AddExcessoAnoBRL = Table.AddColumn(
+        AddExcessoAnualizado,
+        "Excesso_R$_Ano",
+        each if [#"Excesso_R$"]=null or [T_Anos_360]=null or [T_Anos_360]=0
+             then null
+             else [#"Excesso_R$"] / [T_Anos_360],
+        type number
+    ),
+
+    AddFlagVantajosa = Table.AddColumn(
+        AddExcessoAnoBRL,
+        "Flag_Troca_Vantajosa",
+        each [#"Excesso_R$"] <> null and [#"Excesso_R$"] > 0,
+        type logical
+    ),
+
+    AddFlagBreakeven = Table.AddColumn(
+        AddFlagVantajosa,
+        "Flag_Tem_Breakeven",
+        each [Breakeven_Meses] <> null,
+        type logical
     )
 in
-    AddExcessoPct
+    AddFlagBreakeven
